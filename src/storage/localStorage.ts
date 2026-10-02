@@ -61,6 +61,45 @@ function ensureSeeded() {
   if (!localStorage.getItem(STORAGE_KEYS.groupMembers)) writeStorage(STORAGE_KEYS.groupMembers, []);
 }
 
+export function getLegacyLocalDataSnapshot() {
+  return {
+    tests: readStorage<Test[]>(STORAGE_KEYS.tests, []),
+    groups: readStorage<WhatsAppGroup[]>(STORAGE_KEYS.groups, []),
+    rounds: readStorage<TestRound[]>(STORAGE_KEYS.rounds, []),
+    assignments: readStorage<GroupAssignment[]>(STORAGE_KEYS.assignments, []),
+    notes: readStorage<TestNote[]>(STORAGE_KEYS.notes, []),
+    customers: readStorage<Customer[]>(STORAGE_KEYS.customers, []),
+    recruitmentHistory: readStorage<RecruitmentHistory[]>(STORAGE_KEYS.recruitmentHistory, []),
+    groupMembers: readStorage<GroupMember[]>(STORAGE_KEYS.groupMembers, []),
+  };
+}
+
+export type LegacyLocalDataSnapshot = ReturnType<typeof getLegacyLocalDataSnapshot>;
+
+export function replaceLegacyLocalDataSnapshot(snapshot: LegacyLocalDataSnapshot) {
+  const entries = [
+    [STORAGE_KEYS.tests, snapshot.tests],
+    [STORAGE_KEYS.groups, snapshot.groups],
+    [STORAGE_KEYS.rounds, snapshot.rounds],
+    [STORAGE_KEYS.assignments, snapshot.assignments],
+    [STORAGE_KEYS.notes, snapshot.notes],
+    [STORAGE_KEYS.customers, snapshot.customers],
+    [STORAGE_KEYS.recruitmentHistory, snapshot.recruitmentHistory],
+    [STORAGE_KEYS.groupMembers, snapshot.groupMembers],
+  ] as const;
+  const previousValues = new Map(entries.map(([key]) => [key, localStorage.getItem(key)]));
+
+  try {
+    entries.forEach(([key, value]) => writeStorage(key, value));
+  } catch (error) {
+    previousValues.forEach((value, key) => {
+      if (value === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, value);
+    });
+    throw error;
+  }
+}
+
 export function getTests(): Test[] {
   ensureSeeded();
   return readStorage<Test[]>(STORAGE_KEYS.tests, []);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import * as XLSX from 'xlsx';
 import { DateTimePicker } from './DateTimePicker';
 const takeatLogo = new URL('../img/takeat logo.png', import.meta.url).href;
@@ -18,37 +18,23 @@ import {
   CheckCircle2,
   FolderOpen,
   LayoutDashboard,
+  LogOut,
+  Download,
+  Upload,
 } from 'lucide-react';
-import {
-  addGroupMember,
-  createAssignment,
-  createGroup,
-  createNote,
-  createRecruitmentHistory,
-  createRound,
-  createTest,
-  deleteCustomers,
-  deleteGroup,
-  deleteTest,
-  getAssignments,
-  getCustomers,
-  getGroupMembers,
-  getGroups,
-  getNotes,
-  getRecruitmentHistory,
-  getRounds,
-  getTests,
-  importCustomers,
-  updateCustomer,
-  updateCustomerStatus,
-  updateGroup,
-  updateRound,
-  updateTest,
-} from './storage/localStorage';
+import { AuthContext } from './auth/SupabaseAuthGate';
+import { customerService } from './services/customerService';
+import { groupService } from './services/groupService';
+import { recruitmentService } from './services/recruitmentService';
+import { testingService } from './services/testingService';
+import { downloadBackup, readBackupFile, restoreLocalBackup } from './services/backupService';
+import { isSupabaseConfigured } from './lib/supabase';
 import type {
   Customer,
   GroupAssignment,
+  GroupMember,
   GroupStatus,
+  RecruitmentHistory,
   RecruitmentStatus,
   RoundStatus,
   Test,
@@ -219,25 +205,31 @@ function getAssignmentGroupName(groupId: string, groups: WhatsAppGroup[]) {
   return groups.find((group) => group.id === groupId)?.name ?? 'Grupo removido';
 }
 
-function getGroupMemberCountLabel(groupId: string) {
-  const count = getGroupMembers(groupId).length;
+function getGroupMemberCountLabel(count: number) {
   return `${count} ${count === 1 ? 'cliente' : 'clientes'}`;
 }
 
 function App() {
   const [page, setPage] = useState<Page>('home');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [tests, setTests] = useState<Test[]>(() => getTests());
-  const [groups, setGroups] = useState<WhatsAppGroup[]>(() => getGroups());
-  const [rounds, setRounds] = useState<TestRound[]>(() => getRounds());
-  const [assignments, setAssignments] = useState<GroupAssignment[]>(() => getAssignments());
-  const [notes, setNotes] = useState<TestNote[]>(() => getNotes());
-  const [customers, setCustomers] = useState<Customer[]>(() => getCustomers());
+  const authContext = useContext(AuthContext);
+  const [tests, setTests] = useState<Test[]>([]);
+  const [groups, setGroups] = useState<WhatsAppGroup[]>([]);
+  const [rounds, setRounds] = useState<TestRound[]>([]);
+  const [assignments, setAssignments] = useState<GroupAssignment[]>([]);
+  const [notes, setNotes] = useState<TestNote[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [groupMembers, setGroupMembers] = useState<GroupMember[]>([]);
+  const [recruitmentHistory, setRecruitmentHistory] = useState<RecruitmentHistory[]>([]);
+  const [dataError, setDataError] = useState('');
+  const [backupStatus, setBackupStatus] = useState('');
+  const [isDataReady, setIsDataReady] = useState(false);
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
   const [customerImportSources, setCustomerImportSources] = useState<CustomerImportSource[]>(() => [{ id: crypto.randomUUID(), label: '', file: null }]);
   const [modal, setModalState] = useState<ModalType>(null);
   const [isModalClosing, setIsModalClosing] = useState(false);
   const modalCloseTimerRef = useRef<number | null>(null);
-  const [selectedTestId, setSelectedTestId] = useState<string | null>(getTests()[0]?.id ?? null);
+  const [selectedTestId, setSelectedTestId] = useState<string | null>(null);
   const [selectedRoundId, setSelectedRoundId] = useState<string | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null);
@@ -257,6 +249,46 @@ function App() {
   const [customerImportPreview, setCustomerImportPreview] = useState<{ source: string; count: number }[]>([]);
   const [customerImportStatus, setCustomerImportStatus] = useState<string>('');
   const [currentTime, setCurrentTime] = useState(() => Date.now());
+
+  async function runDataOperation(operation: () => Promise<void>) {
+    setDataError('');
+    try {
+      await operation();
+    } catch (error) {
+      setDataError(error instanceof Error ? error.message : 'Não foi possível salvar os dados.');
+    }
+  }
+
+  function submitDataOperation(handler: (event: FormEvent<HTMLFormElement>) => Promise<void>) {
+    return (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      void runDataOperation(() => handler(event));
+    };
+  }
+
+  function handleCreateBackup() {
+    if (!isDataReady) {
+      setBackupStatus('Aguarde o carregamento dos dados antes de criar o backup.');
+      return;
+    }
+
+    downloadBackup({ tests, groups, rounds, assignments, notes, customers, recruitmentHistory, groupMembers });
+    setBackupStatus('Backup baixado para o computador. Guarde o arquivo em local seguro.');
+  }
+
+  async function handleRestoreBackupFile(file: File) {
+    if (isSupabaseConfigured) {
+      throw new Error('A restauração de arquivo está disponível apenas no modo local. Os dados atuais do Supabase já são persistentes.');
+    }
+
+    const backup = await readBackupFile(file);
+    const confirmed = window.confirm('Restaurar este backup substituirá todos os dados locais atuais. Faça um backup atual antes de continuar. Deseja prosseguir?');
+    if (!confirmed) return;
+
+    restoreLocalBackup(backup);
+    await refreshFromStorage();
+    setBackupStatus(`Backup de ${new Date(backup.exportedAt).toLocaleString('pt-BR')} restaurado.`);
+  }
 
   function setModal(nextModal: ModalType) {
     if (nextModal === null) {
@@ -282,6 +314,10 @@ function App() {
   useEffect(() => {
     const interval = window.setInterval(() => setCurrentTime(Date.now()), 60_000);
     return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    void runDataOperation(refreshFromStorage);
   }, []);
 
   const selectedTest = tests.find((test) => test.id === selectedTestId) ?? null;
@@ -349,9 +385,9 @@ function App() {
     .sort((first, second) => (first.expectedEndAt ?? '9999').localeCompare(second.expectedEndAt ?? '9999'))
     .slice(0, 5);
   const activeGroupCount = groups.filter((group) => group.status === 'active').length;
-  const groupMembershipCount = getGroupMembers().length;
+  const groupMembershipCount = groupMembers.length;
   const dashboardGroups = groups
-    .map((group) => ({ group, memberCount: getGroupMembers(group.id).length }))
+    .map((group) => ({ group, memberCount: groupMembers.filter((member) => member.groupId === group.id).length }))
     .sort((first, second) => second.memberCount - first.memberCount)
     .slice(0, 5);
   const recruitmentPipeline = recruitmentStatusOrder.map((status) => ({
@@ -359,13 +395,27 @@ function App() {
     count: customers.filter((customer) => customer.recruitmentStatus === status).length,
   }));
 
-  function refreshFromStorage() {
-    setTests(getTests());
-    setGroups(getGroups());
-    setRounds(getRounds());
-    setAssignments(getAssignments());
-    setNotes(getNotes());
-    setCustomers(getCustomers());
+  async function refreshFromStorage() {
+    const [nextTests, nextGroups, nextRounds, nextAssignments, nextNotes, nextCustomers, nextGroupMembers, nextRecruitmentHistory] = await Promise.all([
+      testingService.getTests(),
+      groupService.getAll(),
+      testingService.getRounds(),
+      testingService.getAssignments(),
+      testingService.getNotes(),
+      customerService.getAll(),
+      groupService.getMembers(),
+      recruitmentService.getAll(),
+    ]);
+    setTests(nextTests);
+    setGroups(nextGroups);
+    setRounds(nextRounds);
+    setAssignments(nextAssignments);
+    setNotes(nextNotes);
+    setCustomers(nextCustomers);
+    setGroupMembers(nextGroupMembers);
+    setRecruitmentHistory(nextRecruitmentHistory);
+    setSelectedTestId((currentId) => currentId && nextTests.some((test) => test.id === currentId) ? currentId : nextTests[0]?.id ?? null);
+    setIsDataReady(true);
   }
 
   async function handleImportCustomers(event: FormEvent<HTMLFormElement>) {
@@ -440,21 +490,21 @@ function App() {
       }
     }
 
-    const summary = importCustomers(entries);
+    const summary = await customerService.importMany(entries);
     setCustomerImportPreview([...new Set(entries.map((entry) => entry.sourceList))].map((source) => ({
       source,
       count: entries.filter((entry) => entry.sourceList === source).length,
     })));
     setCustomerImportStatus(`Importação concluída: ${summary.created} novos, ${summary.updated} atualizados, ${summary.possibleDuplicates} possíveis duplicidades.`);
-    refreshFromStorage();
+    await refreshFromStorage();
     setModal(null);
   }
 
-  function handleCustomerStatusChange(customerId: string, nextStatus: RecruitmentStatus) {
+  async function handleCustomerStatusChange(customerId: string, nextStatus: RecruitmentStatus) {
     const customer = customers.find((item) => item.id === customerId);
     if (!customer || customer.recruitmentStatus === nextStatus) return;
-    updateCustomerStatus(customerId, nextStatus, `Status alterado para ${getRecruitmentLabel(nextStatus)}.`);
-    refreshFromStorage();
+    await customerService.updateStatus(customerId, nextStatus, `Status alterado para ${getRecruitmentLabel(nextStatus)}.`);
+    await refreshFromStorage();
   }
 
   function toggleCustomerSelection(customerId: string) {
@@ -486,24 +536,24 @@ function App() {
     });
   }
 
-  function handleBulkCustomerStatusChange(nextStatus: RecruitmentStatus) {
-    selectedCustomerIds.forEach((customerId) => {
-      updateCustomerStatus(customerId, nextStatus, `Status alterado para ${getRecruitmentLabel(nextStatus)}.`);
-    });
+  async function handleBulkCustomerStatusChange(nextStatus: RecruitmentStatus) {
+    for (const customerId of selectedCustomerIds) {
+      await customerService.updateStatus(customerId, nextStatus, `Status alterado para ${getRecruitmentLabel(nextStatus)}.`);
+    }
     setBulkActionMessage(`Status atualizado para ${selectedCustomerIds.size} ${selectedCustomerIds.size === 1 ? 'cliente' : 'clientes'}.`);
-    refreshFromStorage();
+    await refreshFromStorage();
   }
 
-  function handleBulkCustomerDelete() {
+  async function handleBulkCustomerDelete() {
     const selectedCount = customers.filter((customer) => selectedCustomerIds.has(customer.id)).length;
     const customerLabel = selectedCount === 1 ? 'cliente selecionado' : 'clientes selecionados';
     if (!selectedCount || !window.confirm(`Excluir ${selectedCount} ${customerLabel}? Esta ação não pode ser desfeita.`)) return;
 
-    deleteCustomers([...selectedCustomerIds]);
+    await customerService.deleteMany([...selectedCustomerIds]);
     if (selectedCustomerId && selectedCustomerIds.has(selectedCustomerId)) setSelectedCustomerId(null);
     setSelectedCustomerIds(new Set());
     setBulkActionMessage(`${selectedCount} ${selectedCount === 1 ? 'cliente excluído' : 'clientes excluídos'}.`);
-    refreshFromStorage();
+    await refreshFromStorage();
   }
 
   async function handleCopySelectedCustomerEmails() {
@@ -541,7 +591,7 @@ function App() {
     }
   }
 
-  function handleAddCustomerNote(event: FormEvent<HTMLFormElement>) {
+  async function handleAddCustomerNote(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedCustomer) return;
     const data = new FormData(event.currentTarget);
@@ -549,21 +599,21 @@ function App() {
     if (!note) return;
 
     const nextNotes = selectedCustomer.notes ? `${selectedCustomer.notes}\n\n${new Date().toLocaleDateString('pt-BR')}\n${note}` : `${new Date().toLocaleDateString('pt-BR')}\n${note}`;
-    updateCustomer(selectedCustomer.id, {
+    await customerService.update(selectedCustomer.id, {
       notes: nextNotes,
       updatedAt: new Date().toISOString(),
     });
-    createRecruitmentHistory({
+    await recruitmentService.create({
       customerId: selectedCustomer.id,
       toStatus: selectedCustomer.recruitmentStatus,
       note,
       createdAt: new Date().toISOString(),
     });
-    refreshFromStorage();
+    await refreshFromStorage();
     setModal(null);
   }
 
-  function handleCreateTest(event: FormEvent<HTMLFormElement>) {
+  async function handleCreateTest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const name = String(data.get('name') ?? '').trim();
@@ -577,7 +627,7 @@ function App() {
     const resourceUrl = String(data.get('resourceUrl') ?? '').trim();
     if (!name || !startedAt || !expectedEndAt) return;
 
-    const test = createTest({
+    const test = await testingService.createTest({
       name,
       objective,
       description,
@@ -589,13 +639,13 @@ function App() {
       resourceUrl,
     });
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedTestId(test.id);
     setModal(null);
     setPage('tests');
   }
 
-  function handleEditTest(event: FormEvent<HTMLFormElement>) {
+  async function handleEditTest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedTest) return;
 
@@ -605,7 +655,7 @@ function App() {
     const expectedEndAt = String(data.get('expectedEndAt') ?? '');
     if (!name || !startedAt || !expectedEndAt) return;
 
-    updateTest(selectedTest.id, {
+    await testingService.updateTest(selectedTest.id, {
       name,
       objective: String(data.get('objective') ?? '').trim(),
       description: String(data.get('description') ?? '').trim(),
@@ -617,28 +667,28 @@ function App() {
       resourceUrl: String(data.get('resourceUrl') ?? '').trim(),
     });
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedTestId(selectedTest.id);
     setModal(null);
   }
 
-  function handleDeleteTest(testId: string) {
+  async function handleDeleteTest(testId: string) {
     const confirmed = window.confirm('Deseja excluir este teste? Esta ação também removerá rodadas, associações e anotações relacionadas.');
     if (!confirmed) return;
 
-    deleteTest(testId);
-    refreshFromStorage();
+    await testingService.deleteTest(testId);
+    await refreshFromStorage();
     setSelectedTestId(null);
     setModal(null);
   }
 
-  function handleCreateGroup(event: FormEvent<HTMLFormElement>) {
+  async function handleCreateGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const name = String(data.get('name') ?? '').trim();
     if (!name) return;
 
-    const group = createGroup({
+    const group = await groupService.create({
       name,
       description: String(data.get('description') ?? '').trim(),
       segmentation: String(data.get('segmentation') ?? '').trim(),
@@ -646,13 +696,13 @@ function App() {
       status: (String(data.get('status') ?? 'active') as GroupStatus) || 'active',
     });
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedGroupId(group.id);
     setModal(null);
     setPage('groups');
   }
 
-  function handleEditGroup(event: FormEvent<HTMLFormElement>) {
+  async function handleEditGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedGroup) return;
 
@@ -660,7 +710,7 @@ function App() {
     const name = String(data.get('name') ?? '').trim();
     if (!name) return;
 
-    updateGroup(selectedGroup.id, {
+    await groupService.update(selectedGroup.id, {
       name,
       description: String(data.get('description') ?? '').trim(),
       segmentation: String(data.get('segmentation') ?? '').trim(),
@@ -668,40 +718,42 @@ function App() {
       status: (String(data.get('status') ?? 'active') as GroupStatus) || 'active',
     });
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedGroupId(selectedGroup.id);
     setModal(null);
   }
 
-  function handleDeleteGroup(groupId: string) {
+  async function handleDeleteGroup(groupId: string) {
     const confirmed = window.confirm('Deseja excluir este grupo? Esta ação também removerá as associações e anotações relacionadas.');
     if (!confirmed) return;
 
-    deleteGroup(groupId);
-    refreshFromStorage();
+    await groupService.delete(groupId);
+    await refreshFromStorage();
     setSelectedGroupId(null);
     setModal(null);
   }
 
-  function handleAddParticipantsToGroup(event: FormEvent<HTMLFormElement>) {
+  async function handleAddParticipantsToGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedGroup) return;
 
-    selectedGroupCustomerIds.forEach((customerId) => addGroupMember(selectedGroup.id, customerId));
+    for (const customerId of selectedGroupCustomerIds) {
+      await groupService.addMember(selectedGroup.id, customerId);
+    }
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedGroupCustomerIds(new Set());
     setModal(null);
   }
 
-  function handleCreateRound(event: FormEvent<HTMLFormElement>) {
+  async function handleCreateRound(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const name = String(data.get('name') ?? '').trim();
     const objective = String(data.get('objective') ?? '').trim();
     if (!selectedTestId || !name) return;
 
-    const round = createRound({
+    const round = await testingService.createRound({
       testId: selectedTestId,
       name,
       objective,
@@ -709,12 +761,12 @@ function App() {
       startedAt: new Date().toISOString(),
     });
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedRoundId(round.id);
     setModal(null);
   }
 
-  function handleCreateAssignment(event: FormEvent<HTMLFormElement>) {
+  async function handleCreateAssignment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const roundId = String(data.get('roundId') ?? '').trim();
@@ -723,7 +775,7 @@ function App() {
     const variant = String(data.get('variant') ?? '').trim();
     if (!roundId || !groupId) return;
 
-    const assignment = createAssignment({
+    const assignment = await testingService.createAssignment({
       roundId,
       groupId,
       experienceName,
@@ -732,7 +784,7 @@ function App() {
       notes: String(data.get('notes') ?? '').trim(),
     });
 
-    refreshFromStorage();
+    await refreshFromStorage();
     setSelectedRoundId(roundId);
     setSelectedTestId(rounds.find((item) => item.id === roundId)?.testId ?? selectedTestId);
     setModal(null);
@@ -742,46 +794,45 @@ function App() {
     }
   }
 
-  function handleCreateNote(event: FormEvent<HTMLFormElement>) {
+  async function handleCreateNote(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const content = String(data.get('content') ?? data.get('note') ?? '').trim();
     if (!content) return;
 
-    const note = createNote({
+    await testingService.createNote({
       testId: selectedTestId ?? undefined,
       roundId: selectedRoundId ?? undefined,
       content,
     });
 
-    const nextNotes = [...getNotes(), note];
-    setNotes(nextNotes);
+    await refreshFromStorage();
     setModal(null);
   }
 
-  function advanceTestStatus(test: Test) {
+  async function advanceTestStatus(test: Test) {
     const nextStatus = testStatusOrder[(testStatusOrder.indexOf(test.status) + 1) % testStatusOrder.length];
-    const updated = updateTest(test.id, {
+    const updated = await testingService.updateTest(test.id, {
       status: nextStatus,
       startedAt: test.startedAt ?? new Date().toISOString(),
     });
     if (updated) {
-      refreshFromStorage();
+      await refreshFromStorage();
     }
   }
 
-  function advanceRoundStatus(round: TestRound) {
+  async function advanceRoundStatus(round: TestRound) {
     const nextStatus = roundStatusOrder[(roundStatusOrder.indexOf(round.status) + 1) % roundStatusOrder.length];
-    const updated = updateRound(round.id, {
+    const updated = await testingService.updateRound(round.id, {
       status: nextStatus,
       startedAt: round.startedAt ?? new Date().toISOString(),
     });
     if (updated) {
-      refreshFromStorage();
+      await refreshFromStorage();
     }
   }
 
-  function finishRound(roundId: string, values: FormData) {
+  async function finishRound(roundId: string, values: FormData) {
     const round = rounds.find((item) => item.id === roundId);
     if (!round) return;
 
@@ -789,7 +840,7 @@ function App() {
     const learnings = String(values.get('learnings') ?? '').trim();
     const problems = String(values.get('problems') ?? '').trim();
     const nextSteps = String(values.get('nextSteps') ?? '').trim();
-    const updated = updateRound(roundId, {
+    const updated = await testingService.updateRound(roundId, {
       status: 'completed',
       completedAt: new Date().toISOString(),
       result,
@@ -799,20 +850,20 @@ function App() {
     });
 
     if (updated) {
-      refreshFromStorage();
+      await refreshFromStorage();
       setSelectedRoundId(roundId);
       setModal(null);
     }
   }
 
-  function finishTest(testId: string, values: FormData) {
+  async function finishTest(testId: string, values: FormData) {
     const test = tests.find((item) => item.id === testId);
     if (!test) return;
 
     const finalResult = String(values.get('finalResult') ?? '').trim();
     const learnings = String(values.get('learnings') ?? '').trim();
     const nextSteps = String(values.get('nextSteps') ?? '').trim();
-    const updated = updateTest(testId, {
+    const updated = await testingService.updateTest(testId, {
       status: 'completed',
       completedAt: new Date().toISOString(),
       finalResult,
@@ -821,7 +872,7 @@ function App() {
     });
 
     if (updated) {
-      refreshFromStorage();
+      await refreshFromStorage();
       setSelectedTestId(testId);
       setModal(null);
     }
@@ -830,7 +881,7 @@ function App() {
   const selectedTestRounds = selectedTest ? rounds.filter((round) => round.testId === selectedTest.id) : [];
   const selectedRoundAssignments = selectedRound ? assignments.filter((assignment) => assignment.roundId === selectedRound.id) : [];
   const selectedGroupMembers = selectedGroup
-    ? getGroupMembers(selectedGroup.id)
+    ? groupMembers.filter((member) => member.groupId === selectedGroup.id)
         .map((member) => customers.find((customer) => customer.id === member.customerId))
         .filter(Boolean) as Customer[]
     : [];
@@ -882,16 +933,52 @@ function App() {
             <span className="dot" />
             {!sidebarCollapsed && (
               <div>
-                <strong>Dados locais</strong>
-                <small>Salvo no navegador</small>
+                <strong>{authContext ? 'Supabase conectado' : 'Dados locais'}</strong>
+                <small>{authContext ? authContext.email : 'Salvo no navegador'}</small>
               </div>
             )}
           </div>
+          {authContext && (
+            <button type="button" className="sidebar-logout" onClick={() => void runDataOperation(authContext.signOut)} aria-label="Sair">
+              <LogOut size={16} />
+              {!sidebarCollapsed && <span>Sair</span>}
+            </button>
+          )}
+          <button type="button" className="sidebar-backup" onClick={handleCreateBackup} disabled={!isDataReady} title="Realizar backup">
+            <Download size={16} />
+            {!sidebarCollapsed && <span>Realizar backup</span>}
+          </button>
+          {!isSupabaseConfigured && (
+            <>
+              <button type="button" className="sidebar-backup" onClick={() => backupFileInputRef.current?.click()} title="Restaurar backup">
+                <Upload size={16} />
+                {!sidebarCollapsed && <span>Restaurar backup</span>}
+              </button>
+              <input
+                ref={backupFileInputRef}
+                className="backup-file-input"
+                type="file"
+                accept=".json,application/json"
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = '';
+                  if (file) void runDataOperation(() => handleRestoreBackupFile(file));
+                }}
+              />
+            </>
+          )}
+          {backupStatus && !sidebarCollapsed && <small className="backup-status">{backupStatus}</small>}
         </div>
       </aside>
 
       <main className="main-area">
         <div key={page} className="content-wrap page-transition">
+          {dataError && (
+            <div className="data-error" role="alert">
+              <span>{dataError}</span>
+              <button type="button" className="button outline small" onClick={() => void runDataOperation(refreshFromStorage)}>Tentar novamente</button>
+            </div>
+          )}
           {page === 'home' && (
             <>
               <section className="page-header dashboard-page-header">
@@ -1080,7 +1167,7 @@ function App() {
                 {selectedCustomerIds.size > 0 && (
                   <div className="bulk-selection-actions">
                     <select aria-label="Alterar status dos clientes selecionados" defaultValue="" onChange={(event) => {
-                      if (event.target.value) handleBulkCustomerStatusChange(event.target.value as RecruitmentStatus);
+                      if (event.target.value) void runDataOperation(() => handleBulkCustomerStatusChange(event.target.value as RecruitmentStatus));
                       event.target.value = '';
                     }}>
                       <option value="">Mover para status...</option>
@@ -1090,7 +1177,7 @@ function App() {
                       <Copy size={14} />
                       Copiar emails
                     </button>
-                    <button type="button" className="button outline small" onClick={handleBulkCustomerDelete}>
+                    <button type="button" className="button outline small" onClick={() => void runDataOperation(handleBulkCustomerDelete)}>
                       <Trash2 size={14} />
                       Excluir
                     </button>
@@ -1120,7 +1207,7 @@ function App() {
                           event.preventDefault();
                           const customerId = event.dataTransfer.getData('text/plain');
                           if (!customerId) return;
-                          handleCustomerStatusChange(customerId, kanbanStageToRecruitmentStatus[column.id]);
+                          void runDataOperation(() => handleCustomerStatusChange(customerId, kanbanStageToRecruitmentStatus[column.id]));
                         }}
                       >
                         <div className={`kanban-column-header ${column.tone}`}>
@@ -1320,7 +1407,11 @@ function App() {
                   <div className="test-card-grid">
                     {filteredTests
                       .filter((test) => test.status === 'active' || test.status === 'planned')
-                      .map((test) => <TestCard key={test.id} test={test} onOpen={() => setSelectedTestId(test.id)} />)}
+                      .map((test) => {
+                        const testRounds = rounds.filter((round) => round.testId === test.id);
+                        const groupCount = new Set(assignments.filter((assignment) => testRounds.some((round) => round.id === assignment.roundId)).map((assignment) => assignment.groupId)).size;
+                        return <TestCard key={test.id} test={test} roundCount={testRounds.length} groupCount={groupCount} onOpen={() => setSelectedTestId(test.id)} />;
+                      })}
                   </div>
                 ) : (
                   <EmptyState title="Nenhum teste em andamento" description="Crie um novo experimento para começar a acompanhar as versões e os grupos." actionLabel="Criar teste" onAction={() => setModal('newTest')} />
@@ -1433,7 +1524,15 @@ function App() {
                 </div>
                 {filteredGroups.length ? (
                   <div className="group-card-grid">
-                    {filteredGroups.map((group) => <GroupCard key={group.id} group={group} onOpen={() => setSelectedGroupId(group.id)} />)}
+                    {filteredGroups.map((group) => (
+                      <GroupCard
+                        key={group.id}
+                        group={group}
+                        memberCount={groupMembers.filter((member) => member.groupId === group.id).length}
+                        testsCount={new Set(assignments.filter((assignment) => assignment.groupId === group.id).map((assignment) => rounds.find((round) => round.id === assignment.roundId)?.testId).filter(Boolean)).size}
+                        onOpen={() => setSelectedGroupId(group.id)}
+                      />
+                    ))}
                   </div>
                 ) : (
                   <EmptyState title="Nenhum grupo cadastrado" description="Cadastre grupos de WhatsApp para associar versões e rodadas." actionLabel="Criar grupo" onAction={() => setModal('newGroup')} />
@@ -1464,14 +1563,14 @@ function App() {
                   <p className="eyebrow">TESTE</p>
                   <h2>{selectedTest.name}</h2>
                 </div>
-                <StatusBadge status={selectedTest.status} kind="test" onClick={() => advanceTestStatus(selectedTest)} />
+                <StatusBadge status={selectedTest.status} kind="test" onClick={() => void runDataOperation(() => advanceTestStatus(selectedTest))} />
               </div>
 
               <div className="button-row" style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
                 <button type="button" className="button outline small" onClick={() => setModal('editTest')}>
                   Editar
                 </button>
-                <button type="button" className="button secondary small" onClick={() => handleDeleteTest(selectedTest.id)}>
+                <button type="button" className="button secondary small" onClick={() => void runDataOperation(() => handleDeleteTest(selectedTest.id))}>
                   Excluir
                 </button>
               </div>
@@ -1540,7 +1639,7 @@ function App() {
                               {roundAssignments.length} grupos
                             </small>
                           </div>
-                          <StatusBadge status={round.status} kind="round" onClick={() => advanceRoundStatus(round)} />
+                          <StatusBadge status={round.status} kind="round" onClick={() => void runDataOperation(() => advanceRoundStatus(round))} />
                         </div>
                         <p>{round.objective || 'Sem objetivo definido.'}</p>
                         <div className="round-card-actions">
@@ -1671,7 +1770,7 @@ function App() {
 
               <div className="field">
                 <span>Status de recrutamento</span>
-                <select value={selectedCustomer.recruitmentStatus} onChange={(event) => handleCustomerStatusChange(selectedCustomer.id, event.target.value as RecruitmentStatus)}>
+                <select value={selectedCustomer.recruitmentStatus} onChange={(event) => void runDataOperation(() => handleCustomerStatusChange(selectedCustomer.id, event.target.value as RecruitmentStatus))}>
                   {recruitmentStatusOrder.map((status) => <option key={status} value={status}>{getRecruitmentLabel(status)}</option>)}
                 </select>
               </div>
@@ -1690,8 +1789,8 @@ function App() {
               </div>
 
               <div className="stack-list">
-                {getRecruitmentHistory(selectedCustomer.id).length ? (
-                  getRecruitmentHistory(selectedCustomer.id).map((history) => (
+                {recruitmentHistory.filter((history) => history.customerId === selectedCustomer.id).length ? (
+                  recruitmentHistory.filter((history) => history.customerId === selectedCustomer.id).map((history) => (
                     <div key={history.id} className="mini-record">
                       <div className="mini-record-header">
                         <strong>{formatDateTime(history.createdAt)}</strong>
@@ -1738,7 +1837,7 @@ function App() {
                 <button type="button" className="button outline small" onClick={() => setModal('editGroup')}>
                   Editar
                 </button>
-                <button type="button" className="button secondary small" onClick={() => handleDeleteGroup(selectedGroup.id)}>
+                <button type="button" className="button secondary small" onClick={() => void runDataOperation(() => handleDeleteGroup(selectedGroup.id))}>
                   Excluir
                 </button>
               </div>
@@ -1831,7 +1930,7 @@ function App() {
 
       {modal === 'newTest' && (
         <ModalShell onClose={() => setModal(null)} title="Criar teste" subtitle="NOVO TESTE">
-          <form onSubmit={handleCreateTest} className="modal-form">
+          <form onSubmit={submitDataOperation(handleCreateTest)} className="modal-form">
             <label className="field">
               <span>Nome do teste</span>
               <input name="name" required placeholder="Ex.: Nova tela de pagamento" />
@@ -1878,7 +1977,7 @@ function App() {
 
       {modal === 'editTest' && selectedTest && (
         <ModalShell onClose={() => setModal(null)} title="Editar teste" subtitle="EDITAR TESTE">
-          <form onSubmit={handleEditTest} className="modal-form">
+          <form onSubmit={submitDataOperation(handleEditTest)} className="modal-form">
             <label className="field">
               <span>Nome do teste</span>
               <input name="name" required defaultValue={selectedTest.name} />
@@ -1928,7 +2027,7 @@ function App() {
 
       {modal === 'importCustomers' && (
         <ModalShell onClose={() => setModal(null)} title="Importar clientes" subtitle="IMPORTAÇÃO DE BASE">
-          <form onSubmit={handleImportCustomers} className="modal-form">
+          <form onSubmit={submitDataOperation(handleImportCustomers)} className="modal-form">
             <div className="customer-import-source-list">
               {customerImportSources.map((source, index) => (
                 <div key={source.id} className="customer-import-source-row">
@@ -1993,7 +2092,7 @@ function App() {
 
       {modal === 'addParticipantsToGroup' && selectedGroup && (
         <ModalShell onClose={() => setModal(null)} title="Adicionar participantes" subtitle="GRUPO">
-          <form onSubmit={handleAddParticipantsToGroup} className="modal-form">
+          <form onSubmit={submitDataOperation(handleAddParticipantsToGroup)} className="modal-form">
             <div className="participant-modal-controls">
               <label className="search-box">
                 <Search size={15} />
@@ -2063,7 +2162,7 @@ function App() {
 
       {modal === 'newGroup' && (
         <ModalShell onClose={() => setModal(null)} title="Criar grupo" subtitle="NOVO GRUPO">
-          <form onSubmit={handleCreateGroup} className="modal-form">
+          <form onSubmit={submitDataOperation(handleCreateGroup)} className="modal-form">
             <label className="field">
               <span>Nome do grupo</span>
               <input name="name" required placeholder="Ex.: Restaurantes P" />
@@ -2096,7 +2195,7 @@ function App() {
 
       {modal === 'editGroup' && selectedGroup && (
         <ModalShell onClose={() => setModal(null)} title="Editar grupo" subtitle="EDITAR GRUPO">
-          <form onSubmit={handleEditGroup} className="modal-form">
+          <form onSubmit={submitDataOperation(handleEditGroup)} className="modal-form">
             <label className="field">
               <span>Nome do grupo</span>
               <input name="name" required defaultValue={selectedGroup.name} />
@@ -2129,7 +2228,7 @@ function App() {
 
       {modal === 'newRound' && selectedTest && (
         <ModalShell onClose={() => setModal(null)} title="Criar rodada" subtitle="NOVA RODADA">
-          <form onSubmit={handleCreateRound} className="modal-form">
+          <form onSubmit={submitDataOperation(handleCreateRound)} className="modal-form">
             <label className="field">
               <span>Nome da rodada</span>
               <input name="name" required placeholder="Ex.: Teste A/B" />
@@ -2148,7 +2247,7 @@ function App() {
 
       {modal === 'newAssignment' && selectedRound && (
         <ModalShell onClose={() => setModal(null)} title="Adicionar grupo à rodada" subtitle="ASSOCIAÇÃO">
-          <form onSubmit={handleCreateAssignment} className="modal-form">
+          <form onSubmit={submitDataOperation(handleCreateAssignment)} className="modal-form">
             <input type="hidden" name="roundId" value={selectedRound.id} />
             <label className="field">
               <span>Grupo</span>
@@ -2183,7 +2282,7 @@ function App() {
 
       {modal === 'newNote' && (selectedTest || selectedCustomer) && (
         <ModalShell onClose={() => setModal(null)} title={selectedCustomer ? 'Nova observação' : 'Nova anotação'} subtitle="OBSERVAÇÃO">
-          <form onSubmit={selectedCustomer ? handleAddCustomerNote : handleCreateNote} className="modal-form">
+          <form onSubmit={submitDataOperation(selectedCustomer ? handleAddCustomerNote : handleCreateNote)} className="modal-form">
             <label className="field">
               <span>Conteúdo</span>
               <textarea name="note" rows={5} required placeholder={selectedCustomer ? 'Descreva a conversa, interesse ou observação relevante.' : 'Descreva o comportamento, dilema ou comentário relevante.'} />
@@ -2202,7 +2301,7 @@ function App() {
             onSubmit={(event) => {
               event.preventDefault();
               const values = new FormData(event.currentTarget);
-              finishRound(selectedRound.id, values);
+              void runDataOperation(() => finishRound(selectedRound.id, values));
             }}
             className="modal-form"
           >
@@ -2236,7 +2335,7 @@ function App() {
             onSubmit={(event) => {
               event.preventDefault();
               const values = new FormData(event.currentTarget);
-              finishTest(selectedTest.id, values);
+              void runDataOperation(() => finishTest(selectedTest.id, values));
             }}
             className="modal-form"
           >
@@ -2280,7 +2379,7 @@ function App() {
                   <p className="eyebrow">RODADA</p>
                   <h2>{selectedRound.name}</h2>
                 </div>
-                <StatusBadge status={selectedRound.status} kind="round" onClick={() => advanceRoundStatus(selectedRound)} />
+                <StatusBadge status={selectedRound.status} kind="round" onClick={() => void runDataOperation(() => advanceRoundStatus(selectedRound))} />
               </div>
 
               <div className="summary-grid">
@@ -2318,7 +2417,7 @@ function App() {
                         </div>
                         <div className="assignment-meta">
                           <span>{group?.segmentation || 'Segmentação não informada'}</span>
-                          <span>{group ? getGroupMemberCountLabel(group.id) : '0 clientes'}</span>
+                          <span>{getGroupMemberCountLabel(group ? groupMembers.filter((member) => member.groupId === group.id).length : 0)}</span>
                         </div>
                         <div className="assignment-meta">
                           <span>Experiência: {assignment.experienceName || '—'}</span>
@@ -2394,10 +2493,7 @@ function EmptyState({ title, description, actionLabel, onAction, compact = false
   );
 }
 
-function TestCard({ test, onOpen }: { test: Test; onOpen: () => void }) {
-  const roundCount = getRounds().filter((round) => round.testId === test.id).length;
-  const groupCount = new Set(getAssignments().filter((assignment) => getRounds().some((round) => round.id === assignment.roundId && round.testId === test.id)).map((assignment) => assignment.groupId)).size;
-
+function TestCard({ test, roundCount, groupCount, onOpen }: { test: Test; roundCount: number; groupCount: number; onOpen: () => void }) {
   return (
     <button type="button" className="test-card" onClick={onOpen}>
       <div className="test-card-header">
@@ -2420,21 +2516,13 @@ function TestCard({ test, onOpen }: { test: Test; onOpen: () => void }) {
   );
 }
 
-function GroupCard({ group, onOpen }: { group: WhatsAppGroup; onOpen: () => void }) {
-  const memberCountLabel = getGroupMemberCountLabel(group.id);
-  const testsCount = new Set(
-    getAssignments()
-      .filter((assignment) => assignment.groupId === group.id)
-      .map((assignment) => getRounds().find((round) => round.id === assignment.roundId)?.testId)
-      .filter(Boolean) as string[],
-  ).size;
-
+function GroupCard({ group, memberCount, testsCount, onOpen }: { group: WhatsAppGroup; memberCount: number; testsCount: number; onOpen: () => void }) {
   return (
     <button type="button" className="group-card" onClick={onOpen}>
       <div className="group-card-header">
         <div>
           <h3>{group.name}</h3>
-          <span>{group.segmentation || 'Segmentação não informada'} · {memberCountLabel}</span>
+          <span>{group.segmentation || 'Segmentação não informada'} · {getGroupMemberCountLabel(memberCount)}</span>
         </div>
         <StatusBadge status={group.status} kind="group" />
       </div>

@@ -1,10 +1,13 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { SupabaseAuthGate } from './auth/SupabaseAuthGate';
 import './style.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <SupabaseAuthGate>
+      <App />
+    </SupabaseAuthGate>
   </React.StrictMode>,
 );
